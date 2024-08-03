@@ -1,0 +1,32 @@
+[package]
+name = "min-specialization"
+version = "0.1.0"
+description = "Experimental implementation of specialization"
+license = "MIT"
+keywords = ["macros"]
+categories = []
+repository = "https://github.com/yasuo-ozu/min_specialization"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+proc-macro = true
+path = "lib.rs"
+
+[dependencies]
+proc-macro2 = "1.0"
+template-quote = "0.4"
+proc-macro-error = "1.0"
+derive-syn-parse = "0.1.5"
+proc-generics = { version = "0.1.0", path = "proc-generics" }
+
+[dependencies.syn]
+version = "2.0"
+features = [ "full", "derive", "printing", "extra-traits", "visit-mut", "visit"]
+
+[workspace]
+
+members = [
+	".",
+	"proc-generics"
+]
