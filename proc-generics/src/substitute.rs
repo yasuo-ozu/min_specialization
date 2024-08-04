@@ -270,14 +270,6 @@ where
         let _ = core::mem::replace(&mut subst, next_subst);
     }
     subst
-
-    // (A0, B0) -> S0
-    // (A0, B1) -> S1
-    // (A1, B0) -> S2
-    // (A1, B1) -> S3
-    // (A2, B0) -> S4
-    // (A2, B1) -> S5
-    // [ S0 * S1 + S0 * S3 + S0 * S5 + S2 * S1 + S2 * S3 + S2 * S5 + S4 * S1 + S4 * S3 + S4 * S5 ]
 }
 
 impl<T: Eq + core::hash::Hash> Substitute<HashSet<T>> for SubstituteEnvironment
