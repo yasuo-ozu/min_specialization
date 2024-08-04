@@ -259,15 +259,13 @@ where
     T: PartialEq + Eq + core::hash::Hash,
     SubstituteEnvironment: Substitute<T>,
 {
-    assert!(general.len() > special.len());
-
     let mut subst = Substitution::some();
     for g in general.iter() {
         let mut next_subst = Substitution::empty();
         for s in special.iter() {
             next_subst += subst.clone() * env.substitute(g, s);
         }
-        let _ = core::mem::replace(&mut subst, next_subst);
+        subst = next_subst;
     }
     subst
 }
@@ -387,6 +385,15 @@ impl Substitute<Type> for SubstituteEnvironment {
             ),
             (Type::Paren(g_p), Type::Paren(s_p)) => {
                 self.substitute(g_p.elem.as_ref(), s_p.elem.as_ref())
+            }
+            (Type::Path(g_p), s)
+                if g_p
+                    .path
+                    .get_ident()
+                    .map(|id| self.general_params.contains(id))
+                    == Some(true) =>
+            {
+                Substitution::new(g_p.path.get_ident().unwrap().clone(), s.clone())
             }
             (Type::Path(g_path), Type::Path(s_path)) => {
                 self.substitute(&g_path.qself, &s_path.qself)
