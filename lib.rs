@@ -244,6 +244,7 @@ fn specialize_item_fn_trait(
     ident: &Ident,
     fn_ident: &Ident,
     impl_item_fn: &ImplItemFn,
+    needs_sized_bound: bool,
 ) -> (TokenStream, Punctuated<GenericParam, Token![,]>) {
     let trait_path = &impl_.trait_.as_ref().unwrap().1;
     let impl_generics: Punctuated<_, Token![,]> = impl_
@@ -309,7 +310,9 @@ fn specialize_item_fn_trait(
     impl_item_fn.defaultness = None;
     impl_item_fn.sig.ident = fn_ident.clone();
     let out = quote! {
-        trait #ident<#ty_generics>: #trait_path {
+        trait #ident<#ty_generics>: #trait_path
+            #(if needs_sized_bound) { + ::core::marker::Sized }
+        {
             #item_fn
         }
         impl<#impl_generics> #ident<#ty_generics> for #{&impl_.self_ty}
@@ -341,6 +344,7 @@ fn specialize_item_fn(
     default_impl: &ItemImpl,
     mut ifn: ImplItemFn,
     specials: Vec<(HashMap<Ident, Type>, ItemImpl, ImplItemFn)>,
+    needs_sized_bound: bool,
 ) -> ImplItemFn {
     let itrait_name = Ident::new("__MinSpecialization_InnerTrait", Span::call_site());
     let ifn_name = Ident::new("__min_specialization__inner_fn", Span::call_site());
@@ -385,8 +389,13 @@ fn specialize_item_fn(
                 });
             }
             let sfn = replace_type_params(replacement.clone(), sfn);
-            let (special_trait_impl, special_trait_params) =
-                specialize_item_fn_trait(default_impl, &strait_name, &sfn_name, &sfn);
+            let (special_trait_impl, special_trait_params) = specialize_item_fn_trait(
+                default_impl,
+                &strait_name,
+                &sfn_name,
+                &sfn,
+                needs_sized_bound,
+            );
             quote! {
                 if #condition {
                     #special_trait_impl
@@ -419,8 +428,13 @@ fn specialize_item_fn(
             }
         })
         .collect::<Vec<_>>();
-    let (default_trait_impl, default_trait_params) =
-        specialize_item_fn_trait(default_impl, &itrait_name, &ifn_name, &ifn);
+    let (default_trait_impl, default_trait_params) = specialize_item_fn_trait(
+        default_impl,
+        &itrait_name,
+        &ifn_name,
+        &ifn,
+        needs_sized_bound,
+    );
     let inner = quote! {
         #(for attr in &ifn.attrs) {#attr}
         #{&ifn.vis}
@@ -472,6 +486,37 @@ fn specialize_item_fn(
     parse2(inner).unwrap()
 }
 
+fn check_needs_sized_bound(impl_: &ItemImpl) -> bool {
+    impl_
+        .items
+        .iter()
+        .filter_map(|item| {
+            if let ImplItem::Fn(item) = item {
+                Some(item)
+            } else {
+                None
+            }
+        })
+        .any(|item| {
+            item.sig
+                .inputs
+                .iter()
+                .filter_map(|item| {
+                    if let FnArg::Typed(PatType { ty, .. }) = item {
+                        Some(&*ty)
+                    } else {
+                        None
+                    }
+                })
+                .chain(if let ReturnType::Type(_, ty) = &item.sig.output {
+                    Some(&*ty)
+                } else {
+                    None
+                })
+                .any(|ty| ty == &impl_.self_ty || ty == &parse_quote!(Self))
+        })
+}
+
 fn specialize_impl(
     mut default_impl: ItemImpl,
     special_impls: Vec<(ItemImpl, HashMap<Ident, Type>)>,
@@ -479,6 +524,7 @@ fn specialize_impl(
     if special_impls.len() == 0 {
         return default_impl;
     }
+    let needs_sized_bound = check_needs_sized_bound(&default_impl);
     let mut fn_map = HashMap::new();
     for (simpl, ssub) in special_impls.into_iter() {
         for item in simpl.items.iter() {
@@ -502,6 +548,7 @@ fn specialize_impl(
                     &default_impl,
                     ifn.clone(),
                     specials,
+                    needs_sized_bound,
                 )));
             }
             o => out.push(o.clone()),

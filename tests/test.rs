@@ -21,11 +21,11 @@ mod test_mod {
         }
     }
 
-    // struct S<T>(T);
-    // impl<T> core::ops::AddAssign for S<T> {
-    //     default fn add_assign(&mut self, rhs: Self) {}
-    // }
-    // impl core::ops::AddAssign for S<usize> {
-    //     fn add_assign(&mut self, rhs: Self) {}
-    // }
+    struct S<T>(T);
+    impl<T> core::ops::AddAssign for S<T> {
+        default fn add_assign(&mut self, _rhs: Self) {}
+    }
+    impl core::ops::AddAssign for S<usize> {
+        fn add_assign(&mut self, _rhs: Self) {}
+    }
 }
