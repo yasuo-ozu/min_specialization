@@ -2,9 +2,10 @@ use proc_generics::normalize;
 use proc_generics::normalize::WherePredicateBinding;
 use proc_generics::substitute::{Substitute, SubstituteEnvironment};
 use proc_macro::TokenStream as TokenStream1;
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use proc_macro_error::{abort, proc_macro_error};
 use std::collections::{HashMap, HashSet};
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -211,56 +212,261 @@ fn replace_type_params(map: HashMap<Ident, Ident>, mut ifn: ImplItemFn) -> ImplI
     ifn
 }
 
+fn contains_generics_param(param: &GenericParam, ty: &Type) -> bool {
+    use syn::visit::Visit;
+    struct Visitor<'a>(&'a GenericParam, bool);
+    impl<'ast, 'a> Visit<'ast> for Visitor<'a> {
+        fn visit_lifetime(&mut self, i: &Lifetime) {
+            if matches!(&self.0, GenericParam::Lifetime(l) if &l.lifetime == i) {
+                self.1 = true;
+            }
+        }
+        fn visit_type_path(&mut self, i: &TypePath) {
+            if matches!(
+                (&self.0, &i.qself, i.path.get_ident()),
+                (GenericParam::Type(TypeParam {ident, ..}), &None, Some(id)) |
+                (GenericParam::Const(ConstParam {ident, ..}), &None, Some(id))
+                if ident == id
+            ) {
+                self.1 = true;
+            } else {
+                syn::visit::visit_type_path(self, i)
+            }
+        }
+    }
+    let mut visitor = Visitor(param, false);
+    visitor.visit_type(ty);
+    visitor.1
+}
+
+fn specialize_item_fn_trait(
+    impl_: &ItemImpl,
+    ident: &Ident,
+    fn_ident: &Ident,
+    impl_item_fn: &ImplItemFn,
+) -> (TokenStream, Punctuated<GenericParam, Token![,]>) {
+    let trait_path = &impl_.trait_.as_ref().unwrap().1;
+    let impl_generics: Punctuated<_, Token![,]> = impl_
+        .generics
+        .params
+        .iter()
+        .filter(|p| {
+            contains_generics_param(
+                p,
+                &Type::Path(TypePath {
+                    qself: None,
+                    path: trait_path.clone(),
+                }),
+            ) || contains_generics_param(p, &impl_.self_ty)
+        })
+        .cloned()
+        .collect();
+    let ty_generics: Punctuated<_, Token![,]> = impl_
+        .generics
+        .params
+        .iter()
+        .filter(|p| {
+            contains_generics_param(
+                p,
+                &Type::Path(TypePath {
+                    qself: None,
+                    path: trait_path.clone(),
+                }),
+            )
+        })
+        .map(|p| {
+            let mut p = p.clone();
+            match &mut p {
+                GenericParam::Lifetime(p) => {
+                    p.attrs = Vec::new();
+                    p.colon_token = None;
+                    p.bounds = Punctuated::new();
+                }
+                GenericParam::Type(t) => {
+                    t.attrs = Vec::new();
+                    t.colon_token = None;
+                    t.bounds = Punctuated::new();
+                    t.eq_token = None;
+                    t.default = None;
+                }
+                GenericParam::Const(c) => {
+                    c.attrs = Vec::new();
+                    c.eq_token = None;
+                    c.default = None;
+                }
+            }
+            p
+        })
+        .collect();
+    let mut item_fn = TraitItemFn {
+        attrs: vec![],
+        sig: impl_item_fn.sig.clone(),
+        default: None,
+        semi_token: Some(Default::default()),
+    };
+    item_fn.sig.ident = fn_ident.clone();
+    let mut impl_item_fn = impl_item_fn.clone();
+    impl_item_fn.defaultness = None;
+    impl_item_fn.sig.ident = fn_ident.clone();
+    let out = quote! {
+        trait #ident<#ty_generics>: #trait_path {
+            #item_fn
+        }
+        impl<#impl_generics> #ident<#ty_generics> for #{&impl_.self_ty}
+        #{&impl_.generics.where_clause}
+        {
+            #impl_item_fn
+        }
+    };
+    (out, ty_generics)
+}
+
+fn set_argument_named(sig: &mut Signature) {
+    for (n, arg) in sig.inputs.iter_mut().enumerate() {
+        if let FnArg::Typed(PatType { pat, .. }) = arg {
+            if let Pat::Wild(_) = &**pat {
+                *pat = Box::new(Pat::Ident(PatIdent {
+                    attrs: Vec::new(),
+                    by_ref: None,
+                    mutability: None,
+                    ident: Ident::new(&format!("_min_specialization_v{}", n), pat.span()),
+                    subpat: None,
+                }));
+            }
+        }
+    }
+}
+
 fn specialize_item_fn(
-    ifn: ImplItemFn,
-    specials: Vec<(HashMap<Ident, Type>, ImplItemFn)>,
+    default_impl: &ItemImpl,
+    mut ifn: ImplItemFn,
+    specials: Vec<(HashMap<Ident, Type>, ItemImpl, ImplItemFn)>,
 ) -> ImplItemFn {
+    let itrait_name = Ident::new("__MinSpecialization_InnerTrait", Span::call_site());
+    let ifn_name = Ident::new("__min_specialization__inner_fn", Span::call_site());
+    set_argument_named(&mut ifn.sig);
     let specials_out = specials
         .into_iter()
         .enumerate()
-        .map(|(n, (m, mut sfn))| {
-            sfn.sig.ident = Ident::new(
-                &format!("__min_specialization_inner_fn_{}", n),
-                sfn.sig.ident.span(),
+        .map(|(n, (m, simpl, mut sfn))| {
+            let strait_name = Ident::new(
+                &format!("__MinSpecialization_InnerTrait_{}", n),
+                Span::call_site(),
             );
+            let sfn_name = Ident::new(
+                &format!("__min_specialization__inner_fn_{}", n),
+                Span::call_site(),
+            );
+            sfn.sig.ident = sfn_name.clone();
             let mut condition = quote! {true};
             let mut replacement = HashMap::new();
             for (lhs, rhs) in m.into_iter() {
                 if let Some(rhs) = get_type_ident(rhs.clone()) {
-                    replacement.insert(rhs, lhs);
-                } else {
-                    condition.extend(quote! {
-                        && __min_specialization_id::<#lhs> as *const ()
-                            == __min_specialization_id::<#rhs> as *const ()
-                    });
+                    if simpl
+                        .generics
+                        .params
+                        .iter()
+                        .filter_map(|p| {
+                            if let GenericParam::Type(p) = p {
+                                Some(&p.ident)
+                            } else {
+                                None
+                            }
+                        })
+                        .any(|p| p == &rhs)
+                    {
+                        replacement.insert(rhs, lhs);
+                        continue;
+                    }
                 }
+                condition.extend(quote! {
+                    && __min_specialization_id::<#lhs> as *const ()
+                        == __min_specialization_id::<#rhs> as *const ()
+                });
             }
-            let sfn = replace_type_params(replacement, sfn);
+            let sfn = replace_type_params(replacement.clone(), sfn);
+            let (special_trait_impl, special_trait_params) =
+                specialize_item_fn_trait(default_impl, &strait_name, &sfn_name, &sfn);
             quote! {
                 if #condition {
-                    #sfn
-                    #{&sfn.sig.ident} (
-                        #(for arg in &ifn.sig.inputs), {
-                            #(if let FnArg::Receiver(_) = arg) {
-                                self
+                    #special_trait_impl
+                    __min_specialization_transmute(
+                        <#{&default_impl.self_ty} as #strait_name<
+                            #(for par in &special_trait_params), {
+                                #(if let GenericParam::Type(TypeParam{ident, ..}) = par) {
+                                    #(if let Some(ident) = replacement.get(ident)) {
+                                        #ident
+                                    }
+                                    #(else) {
+                                        #ident
+                                    }
+                                } #(else) {
+                                    #par
+                                }
                             }
-                            #(if let FnArg::Typed(pt) = arg) {
-                                #{&pt.pat}
+                        >>::#sfn_name(
+                            #(for arg in &ifn.sig.inputs), {
+                                #(if let FnArg::Receiver(_) = arg) {
+                                    self
+                                }
+                                #(if let FnArg::Typed(pt) = arg) {
+                                    #{&pt.pat}
+                                }
                             }
-                        }
+                        )
                     )
                 } else
             }
         })
         .collect::<Vec<_>>();
+    let (default_trait_impl, default_trait_params) =
+        specialize_item_fn_trait(default_impl, &itrait_name, &ifn_name, &ifn);
     let inner = quote! {
         #(for attr in &ifn.attrs) {#attr}
         #{&ifn.vis}
         #{&ifn.sig}
         {
-            fn __min_specialization_id<T>() {}
+            fn __min_specialization_id<T>(input: &T) -> ! {
+                unsafe {
+                    let _ = ::core::mem::MaybeUninit::new(
+                        ::core::ptr::read_volatile(input as *const _)
+                    );
+                }
+                ::core::panic!()
+            }
+            fn __min_specialization_transmute<T, U>(input: T) -> U {
+                ::core::assert_eq!(
+                    ::core::mem::size_of::<T>(),
+                    ::core::mem::size_of::<U>()
+                );
+                ::core::assert_eq!(
+                    ::core::mem::align_of::<T>(),
+                    ::core::mem::align_of::<U>()
+                );
+                let mut rhs = ::core::mem::MaybeUninit::new(input);
+                let mut lhs = ::core::mem::MaybeUninit::<U>::uninit();
+                unsafe {
+                    let rhs = ::core::mem::transmute::<
+                        _, &mut ::core::mem::MaybeUninit<U>
+                    >(&mut rhs);
+                    ::core::ptr::swap(lhs.as_mut_ptr(), rhs.as_mut_ptr());
+                    lhs.assume_init()
+                }
+            }
             #( #specials_out)*
-            { #(for stmt in &ifn.block.stmts) {#stmt} }
+            {
+                #default_trait_impl
+                <#{&default_impl.self_ty} as #itrait_name<#default_trait_params>>::#ifn_name(
+                    #(for arg in &ifn.sig.inputs),{
+                        #(if let FnArg::Receiver(Receiver{self_token, ..}) = arg) {
+                            #self_token
+                        }
+                        #(if let FnArg::Typed(PatType{pat, ..}) = arg) {
+                            #pat
+                        }
+                    }
+                )
+            }
         }
     };
     parse2(inner).unwrap()
@@ -273,28 +479,32 @@ fn specialize_impl(
     if special_impls.len() == 0 {
         return default_impl;
     }
-    let mut fn_map: HashMap<Ident, Vec<(HashMap<Ident, Type>, ImplItemFn)>> = HashMap::new();
+    let mut fn_map = HashMap::new();
     for (simpl, ssub) in special_impls.into_iter() {
-        for item in simpl.items.into_iter() {
+        for item in simpl.items.iter() {
             match item {
                 ImplItem::Fn(ifn) => {
                     fn_map
                         .entry(ifn.sig.ident.clone())
                         .or_insert(Vec::new())
-                        .push((ssub.clone(), ifn));
+                        .push((ssub.clone(), simpl.clone(), ifn.clone()));
                 }
                 o => abort!(o.span(), "This item cannot be specialized"),
             }
         }
     }
     let mut out = Vec::new();
-    for item in default_impl.items.into_iter() {
+    for item in &default_impl.items {
         match item {
             ImplItem::Fn(ifn) => {
                 let specials = fn_map.get(&ifn.sig.ident).cloned().unwrap_or(Vec::new());
-                out.push(ImplItem::Fn(specialize_item_fn(ifn, specials)));
+                out.push(ImplItem::Fn(specialize_item_fn(
+                    &default_impl,
+                    ifn.clone(),
+                    specials,
+                )));
             }
-            o => out.push(o),
+            o => out.push(o.clone()),
         }
     }
     default_impl.items = out;
