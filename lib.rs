@@ -134,11 +134,15 @@ fn substitute_impl(
         .collect()
 }
 
-fn replace_type_params(map: HashMap<Ident, Ident>, mut ifn: ImplItemFn) -> ImplItemFn {
+trait ReplaceTypeParams {
+    fn replace_type_params(self, map: HashMap<Ident, Type>) -> Self;
+}
+
+const _: () = {
     fn filter_map_with_generics(
-        map: &HashMap<Ident, Ident>,
+        map: &HashMap<Ident, Type>,
         generics: &Generics,
-    ) -> HashMap<Ident, Ident> {
+    ) -> HashMap<Ident, Type> {
         map.clone()
             .into_iter()
             .filter(|(k, _)| {
@@ -157,21 +161,13 @@ fn replace_type_params(map: HashMap<Ident, Ident>, mut ifn: ImplItemFn) -> ImplI
             .collect()
     }
     #[derive(Clone)]
-    struct Visitor(HashMap<Ident, Ident>);
+    struct Visitor(HashMap<Ident, Type>);
     impl VisitMut for Visitor {
         fn visit_type_mut(&mut self, i: &mut Type) {
             if let Type::Path(tp) = i {
                 if let Some(id) = tp.path.get_ident() {
                     if let Some(replaced) = self.0.get(id) {
-                        tp.path = Path {
-                            leading_colon: None,
-                            segments: Some(PathSegment {
-                                ident: replaced.clone(),
-                                arguments: PathArguments::None,
-                            })
-                            .into_iter()
-                            .collect(),
-                        };
+                        *i = replaced.clone();
                         return;
                     }
                 }
@@ -207,10 +203,21 @@ fn replace_type_params(map: HashMap<Ident, Ident>, mut ifn: ImplItemFn) -> ImplI
             syn::visit_mut::visit_item_union_mut(&mut this, i);
         }
     }
-    let mut visitor = Visitor(map);
-    visitor.visit_impl_item_fn_mut(&mut ifn);
-    ifn
-}
+    impl ReplaceTypeParams for ImplItemFn {
+        fn replace_type_params(mut self, map: HashMap<Ident, Type>) -> Self {
+            let mut visitor = Visitor(map);
+            visitor.visit_impl_item_fn_mut(&mut self);
+            self
+        }
+    }
+    impl ReplaceTypeParams for Type {
+        fn replace_type_params(mut self, map: HashMap<Ident, Type>) -> Self {
+            let mut visitor = Visitor(map);
+            visitor.visit_type_mut(&mut self);
+            self
+        }
+    }
+};
 
 fn contains_generics_param(param: &GenericParam, ty: &Type) -> bool {
     use syn::visit::Visit;
@@ -245,6 +252,7 @@ fn specialize_item_fn_trait(
     fn_ident: &Ident,
     impl_item_fn: &ImplItemFn,
     needs_sized_bound: bool,
+    self_ty: &Type,
 ) -> (TokenStream, Punctuated<GenericParam, Token![,]>) {
     let trait_path = &impl_.trait_.as_ref().unwrap().1;
     let impl_generics: Punctuated<_, Token![,]> = impl_
@@ -258,7 +266,7 @@ fn specialize_item_fn_trait(
                     qself: None,
                     path: trait_path.clone(),
                 }),
-            ) || contains_generics_param(p, &impl_.self_ty)
+            ) || contains_generics_param(p, self_ty)
         })
         .cloned()
         .collect();
@@ -315,7 +323,7 @@ fn specialize_item_fn_trait(
         {
             #item_fn
         }
-        impl<#impl_generics> #ident<#ty_generics> for #{&impl_.self_ty}
+        impl<#impl_generics> #ident<#ty_generics> for #self_ty
         #{&impl_.generics.where_clause}
         {
             #impl_item_fn
@@ -364,7 +372,7 @@ fn specialize_item_fn(
             sfn.sig.ident = sfn_name.clone();
             let mut condition = quote! {true};
             let mut replacement = HashMap::new();
-            for (lhs, rhs) in m.into_iter() {
+            for (lhs, rhs) in m.iter() {
                 if let Some(rhs) = get_type_ident(rhs.clone()) {
                     if simpl
                         .generics
@@ -379,6 +387,18 @@ fn specialize_item_fn(
                         })
                         .any(|p| p == &rhs)
                     {
+                        let lhs = Type::Path(TypePath {
+                            qself: None,
+                            path: Path {
+                                leading_colon: None,
+                                segments: Some(PathSegment {
+                                    ident: lhs.clone(),
+                                    arguments: PathArguments::None,
+                                })
+                                .into_iter()
+                                .collect(),
+                            },
+                        });
                         replacement.insert(rhs, lhs);
                         continue;
                     }
@@ -388,19 +408,21 @@ fn specialize_item_fn(
                         == __min_specialization_id::<#rhs> as *const ()
                 });
             }
-            let sfn = replace_type_params(replacement.clone(), sfn);
+            let sfn = sfn.replace_type_params(replacement.clone());
+            let replaced_self_ty = default_impl.self_ty.clone().replace_type_params(m.clone());
             let (special_trait_impl, special_trait_params) = specialize_item_fn_trait(
                 default_impl,
                 &strait_name,
                 &sfn_name,
                 &sfn,
                 needs_sized_bound,
+                &replaced_self_ty,
             );
             quote! {
                 if #condition {
                     #special_trait_impl
                     __min_specialization_transmute(
-                        <#{&default_impl.self_ty} as #strait_name<
+                        <#replaced_self_ty as #strait_name<
                             #(for par in &special_trait_params), {
                                 #(if let GenericParam::Type(TypeParam{ident, ..}) = par) {
                                     #(if let Some(ident) = replacement.get(ident)) {
@@ -416,10 +438,14 @@ fn specialize_item_fn(
                         >>::#sfn_name(
                             #(for arg in &ifn.sig.inputs), {
                                 #(if let FnArg::Receiver(_) = arg) {
-                                    self
+                                    __min_specialization_transmute(self)
                                 }
                                 #(if let FnArg::Typed(pt) = arg) {
-                                    #{&pt.pat}
+                                    #(if &*pt.ty == &Type::Path(parse_quote!(Self))) {
+                                        __min_specialization_transmute(#{&pt.pat})
+                                    } #(else) {
+                                        #{&pt.pat}
+                                    }
                                 }
                             }
                         )
@@ -434,6 +460,7 @@ fn specialize_item_fn(
         &ifn_name,
         &ifn,
         needs_sized_bound,
+        &default_impl.self_ty,
     );
     let inner = quote! {
         #(for attr in &ifn.attrs) {#attr}

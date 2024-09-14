@@ -21,6 +21,7 @@ mod test_mod {
         }
     }
 
+    #[allow(unused)]
     struct S<T>(T);
     impl<T> core::ops::AddAssign for S<T> {
         default fn add_assign(&mut self, _rhs: Self) {}
