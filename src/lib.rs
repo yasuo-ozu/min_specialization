@@ -1,10 +1,14 @@
-use proc_generics::normalize;
-use proc_generics::normalize::WherePredicateBinding;
-use proc_generics::substitute::{Substitute, SubstituteEnvironment};
+#![doc = include_str!("../README.md")]
+
+mod normalize;
+mod substitute;
+
+use normalize::WherePredicateBinding;
 use proc_macro::TokenStream as TokenStream1;
 use proc_macro2::{Span, TokenStream};
 use proc_macro_error::{abort, proc_macro_error};
 use std::collections::{HashMap, HashSet};
+use substitute::{Substitute, SubstituteEnvironment};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;

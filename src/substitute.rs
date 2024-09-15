@@ -19,18 +19,6 @@ impl Substitution {
         Self(vec![Some((param, ty)).into_iter().collect()])
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn into_option(self) -> Option<Self> {
-        if self.is_empty() {
-            None
-        } else {
-            Some(self)
-        }
-    }
-
     fn merge(
         mut lhs: HashMap<Ident, Type>,
         rhs: HashMap<Ident, Type>,
