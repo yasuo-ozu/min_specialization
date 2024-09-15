@@ -4,8 +4,8 @@
 [crates.io]: https://crates.io/crates/min-specialization
 [Documentation]: https://img.shields.io/docsrs/min-specialization
 [docs.rs]: https://docs.rs/min-specialization/latest/min-specialization/
-[GitHub Actions]: https://github.com/yasuo-ozu/min-specialization/actions/workflows/rust.yml/badge.svg
-[actions]: https://github.com/yasuo-ozu/min-specialization/actions/workflows/rust.yml
+[GitHub Actions]: https://github.com/yasuo-ozu/min_specialization/actions/workflows/rust.yml/badge.svg
+[actions]: https://github.com/yasuo-ozu/min_specialization/actions/workflows/rust.yml
 
 Rust's specialization feature allows you to provide a default implementation of a trait for generic types and then specialize it for specific types. This feature is currently unstable and only available on the nightly version of Rust.
 
