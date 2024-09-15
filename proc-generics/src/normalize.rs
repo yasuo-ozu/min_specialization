@@ -204,7 +204,9 @@ fn remove_path_predicates(path: &mut Path) -> Vec<(Path, Vec<AssocType>, Vec<Con
             o => PathVisitor.visit_path_arguments_mut(o),
         }
         current_path.segments.push(seg.clone());
-        ret.push((current_path.clone(), bindings, constraints));
+        if bindings.len() > 0 || constraints.len() > 0 {
+            ret.push((current_path.clone(), bindings, constraints));
+        }
     }
     ret
 }

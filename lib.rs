@@ -106,6 +106,26 @@ fn substitute_impl(
 ) -> Vec<(HashMap<Ident, Type>, usize)> {
     let (d_ps, d_ws) = normalize_params_and_predicates(default_impl);
     let (s_ps, s_ws) = normalize_params_and_predicates(special_impl);
+    // Remove `Self` type
+    let self_ident = Ident::new("Self", Span::call_site());
+    let d_ws = d_ws
+        .into_iter()
+        .map(|w| {
+            w.replace_type_params(
+                core::iter::once((self_ident.clone(), default_impl.self_ty.as_ref().clone()))
+                    .collect(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let s_ws = s_ws
+        .into_iter()
+        .map(|w| {
+            w.replace_type_params(
+                core::iter::once((self_ident.clone(), special_impl.self_ty.as_ref().clone()))
+                    .collect(),
+            )
+        })
+        .collect::<HashSet<_>>();
     let s_ps: HashSet<_> = s_ps.into_iter().filter_map(get_param_ident).collect();
     let env = SubstituteEnvironment {
         general_params: d_ps.into_iter().filter_map(get_param_ident).collect(),
@@ -201,6 +221,42 @@ const _: () = {
         fn visit_item_union_mut(&mut self, i: &mut ItemUnion) {
             let mut this = Visitor(filter_map_with_generics(&self.0, &i.generics));
             syn::visit_mut::visit_item_union_mut(&mut this, i);
+        }
+    }
+
+    impl ReplaceTypeParams for WherePredicateBinding {
+        fn replace_type_params(self, map: HashMap<Ident, Type>) -> Self {
+            match self {
+                WherePredicateBinding::Lifetime(lt) => {
+                    WherePredicateBinding::Lifetime(lt.replace_type_params(map))
+                }
+                WherePredicateBinding::Type(pt) => {
+                    WherePredicateBinding::Type(pt.replace_type_params(map))
+                }
+                WherePredicateBinding::Eq {
+                    lhs_ty,
+                    eq_token,
+                    rhs_ty,
+                } => WherePredicateBinding::Eq {
+                    lhs_ty: lhs_ty.replace_type_params(map.clone()),
+                    eq_token,
+                    rhs_ty: rhs_ty.replace_type_params(map),
+                },
+            }
+        }
+    }
+    impl ReplaceTypeParams for PredicateType {
+        fn replace_type_params(mut self, map: HashMap<Ident, Type>) -> Self {
+            let mut visitor = Visitor(map);
+            visitor.visit_predicate_type_mut(&mut self);
+            self
+        }
+    }
+    impl ReplaceTypeParams for PredicateLifetime {
+        fn replace_type_params(mut self, map: HashMap<Ident, Type>) -> Self {
+            let mut visitor = Visitor(map);
+            visitor.visit_predicate_lifetime_mut(&mut self);
+            self
         }
     }
     impl ReplaceTypeParams for ImplItemFn {

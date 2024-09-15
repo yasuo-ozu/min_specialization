@@ -242,7 +242,7 @@ impl Substitute<TraitBound> for SubstituteEnvironment {
         // TODO: consider lifetime order (assignment)
         if &general.paren_token != &special.paren_token
             || &general.modifier != &special.modifier
-            || &general.lifetimes == &special.lifetimes
+            || &general.lifetimes != &special.lifetimes
         {
             return Substitution::empty();
         }
