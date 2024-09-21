@@ -15,6 +15,22 @@ use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
 
+fn replace_type_of_trait_item_fn(mut ty: TraitItemFn, from: &Type, to: &Type) -> TraitItemFn {
+    use syn::visit_mut::VisitMut;
+    struct Visitor<'a>(&'a Type, &'a Type);
+    impl<'a> VisitMut for Visitor<'a> {
+        fn visit_type_mut(&mut self, ty: &mut Type) {
+            if &ty == &self.0 {
+                *ty = self.1.clone();
+            }
+            syn::visit_mut::visit_type_mut(self, ty)
+        }
+    }
+    let mut visitor = Visitor(from, to);
+    visitor.visit_trait_item_fn_mut(&mut ty);
+    ty
+}
+
 fn check_defaultness(item_impl: &ItemImpl) -> Option<bool> {
     let mut ret = false;
     // does not support impl-level default keyword
@@ -367,12 +383,16 @@ fn specialize_item_fn_trait(
             p
         })
         .collect();
-    let mut item_fn = TraitItemFn {
-        attrs: vec![],
-        sig: impl_item_fn.sig.clone(),
-        default: None,
-        semi_token: Some(Default::default()),
-    };
+    let mut item_fn = replace_type_of_trait_item_fn(
+        TraitItemFn {
+            attrs: vec![],
+            sig: impl_item_fn.sig.clone(),
+            default: None,
+            semi_token: Some(Default::default()),
+        },
+        &impl_.self_ty,
+        &parse_quote!(Self),
+    );
     item_fn.sig.ident = fn_ident.clone();
     let mut impl_item_fn = impl_item_fn.clone();
     impl_item_fn.defaultness = None;
@@ -501,11 +521,7 @@ fn specialize_item_fn(
                                     __min_specialization_transmute(self)
                                 }
                                 #(if let FnArg::Typed(pt) = arg) {
-                                    #(if &*pt.ty == &Type::Path(parse_quote!(Self))) {
-                                        __min_specialization_transmute(#{&pt.pat})
-                                    } #(else) {
-                                        #{&pt.pat}
-                                    }
+                                    __min_specialization_transmute(#{&pt.pat})
                                 }
                             }
                         )
