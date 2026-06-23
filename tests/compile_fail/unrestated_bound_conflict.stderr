@@ -1,0 +1,7 @@
+error[E0119]: conflicting implementations of trait `Ser` for type `i32`
+ --> tests/compile_fail/unrestated_bound_conflict.rs:6:5
+  |
+5 |     impl<T: core::fmt::Debug> Ser for T { default fn s(&self) -> String { format!("{:?}", self) } }
+  |     ----------------------------------- first implementation here
+6 |     impl Ser for i32 { fn s(&self) -> String { "int".into() } } // omits `T: Debug`
+  |     ^^^^^^^^^^^^^^^^ conflicting implementation for `i32`

@@ -1,0 +1,8 @@
+error: conflicting specializations: this impl overlaps another specialization of the same trait for the same type
+
+         = note: min-specialization cannot order overlapping specializations
+
+ --> tests/compile_fail/overlapping_specializations.rs:7:5
+  |
+7 |     impl Tr for i32 { fn f(&self) -> u32 { 200 } }
+  |     ^^^^

@@ -1,4 +1,6 @@
+use proc_macro_error::abort;
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 use syn::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -93,14 +95,11 @@ pub fn normalize_where_predicate(pred: WherePredicate) -> Vec<WherePredicateBind
                     bounds: Some(bound.clone()).into_iter().collect(),
                 }));
             }
-        } // WherePredicate::Eq(pe) => {
-        //     ret.push(WherePredicate::Eq(PredicateEq {
-        //         lhs_ty: pe.lhs_ty,
-        //         eq_token: pe.eq_token,
-        //         rhs_ty: pe.rhs_ty,
-        //     }));
-        // }
-        _ => panic!(),
+        }
+        other => abort!(
+            other.span(),
+            "this kind of `where` predicate is not supported by #[specialization]"
+        ),
     }
     ret
 }
@@ -108,25 +107,24 @@ pub fn normalize_where_predicate(pred: WherePredicate) -> Vec<WherePredicateBind
 pub fn normalize_generic_param(param: GenericParam) -> (GenericParam, Vec<WherePredicateBinding>) {
     match param {
         GenericParam::Type(mut pt) => {
-            let mut preds = Vec::new();
-            if let Some(colon_token) = pt.colon_token {
-                for mut bound in pt.bounds.into_iter() {
-                    if let TypeParamBound::Trait(tb) = &mut bound {
-                        let ret = remove_path_predicates(&mut tb.path);
-                        assert!(ret.is_empty());
-                    }
-                    preds.push(WherePredicateBinding::Type(PredicateType {
-                        lifetimes: None,
-                        bounded_ty: Type::Path(TypePath {
-                            path: pt.ident.clone().into(),
-                            qself: None,
-                        }),
-                        colon_token: colon_token.clone(),
-                        bounds: Some(bound).into_iter().collect(),
-                    }));
-                }
-            }
-            pt.colon_token = None;
+            // A bounded type parameter `T: Bound` is equivalent to a `where T: Bound`
+            // predicate, so reuse the where-clause normalizer. This keeps associated
+            // type bindings written in parameter position (e.g.
+            // `impl<X: Iterator<Item = u8>>`) working, rather than rejecting them.
+            let preds = if let Some(colon_token) = pt.colon_token.take() {
+                let bounds = core::mem::replace(&mut pt.bounds, Punctuated::new());
+                normalize_where_predicate(WherePredicate::Type(PredicateType {
+                    lifetimes: None,
+                    bounded_ty: Type::Path(TypePath {
+                        path: pt.ident.clone().into(),
+                        qself: None,
+                    }),
+                    colon_token,
+                    bounds,
+                }))
+            } else {
+                Vec::new()
+            };
             pt.bounds = Punctuated::new();
             (GenericParam::Type(pt), preds)
         }
@@ -150,31 +148,22 @@ pub fn normalize_generic_param(param: GenericParam) -> (GenericParam, Vec<WhereP
 }
 
 fn remove_path_predicates(path: &mut Path) -> Vec<(Path, Vec<AssocType>, Vec<Constraint>)> {
-    trait Take: Sized {
-        fn take_owned(&mut self, closure: impl FnOnce(Self) -> Self) -> &mut Self;
-    }
-
-    impl<T> Take for T {
-        fn take_owned(&mut self, closure: impl FnOnce(Self) -> Self) -> &mut Self {
-            use core::ptr;
-            use std::panic;
-
-            unsafe {
-                let oldval = ptr::read(self);
-                let newval = panic::catch_unwind(panic::AssertUnwindSafe(|| closure(oldval)))
-                    .unwrap_or_else(|_| ::std::process::abort());
-                ptr::write(self, newval);
-            }
-            self
-        }
-    }
     struct PathVisitor;
     use syn::visit_mut::VisitMut;
 
     impl VisitMut for PathVisitor {
         fn visit_path_mut(&mut self, i: &mut Path) {
-            let ret = remove_path_predicates(i);
-            assert!(ret.is_empty());
+            // Associated-type bindings/bounds are only normalized at the top level
+            // of a predicate. Finding one nested inside another type argument (e.g.
+            // `Iterator<Item: Iterator<Item = u8>>` or `Vec<Foo<Bar = u8>>`) means
+            // we cannot represent it, so report it cleanly rather than mishandling it.
+            if !remove_path_predicates(i).is_empty() {
+                abort!(
+                    i.span(),
+                    "nested associated type bindings are not supported by #[specialization]";
+                    help = "lift the inner associated type binding into a separate `where` predicate"
+                );
+            }
             syn::visit_mut::visit_path_mut(self, i);
         }
     }
@@ -188,18 +177,17 @@ fn remove_path_predicates(path: &mut Path) -> Vec<(Path, Vec<AssocType>, Vec<Con
         let mut constraints = Vec::new();
         match &mut seg.arguments {
             PathArguments::AngleBracketed(args) => {
-                args.args.take_owned(|args| {
-                    let mut new_args = Punctuated::new();
-                    for mut arg in args.into_iter() {
-                        PathVisitor.visit_generic_argument_mut(&mut arg);
-                        match arg {
-                            GenericArgument::AssocType(binding) => bindings.push(binding),
-                            GenericArgument::Constraint(constraint) => constraints.push(constraint),
-                            o => new_args.push(o),
-                        }
+                let old_args = core::mem::take(&mut args.args);
+                let mut new_args = Punctuated::new();
+                for mut arg in old_args.into_iter() {
+                    PathVisitor.visit_generic_argument_mut(&mut arg);
+                    match arg {
+                        GenericArgument::AssocType(binding) => bindings.push(binding),
+                        GenericArgument::Constraint(constraint) => constraints.push(constraint),
+                        o => new_args.push(o),
                     }
-                    new_args
-                });
+                }
+                args.args = new_args;
             }
             o => PathVisitor.visit_path_arguments_mut(o),
         }

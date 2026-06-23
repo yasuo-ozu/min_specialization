@@ -1,0 +1,8 @@
+error: `b` is overridden in a specialization but is not defined in the default impl, so it cannot be specialized
+
+         = help: give the default impl a `default fn b` to specialize
+
+ --> tests/compile_fail/specialized_method_not_in_default.rs:6:52
+  |
+6 |     impl Tr for i32 { fn a(&self) -> u32 { 10 } fn b(&self) -> u32 { 20 } }
+  |                                                    ^

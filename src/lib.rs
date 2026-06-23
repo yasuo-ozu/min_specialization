@@ -31,6 +31,24 @@ fn replace_type_of_trait_item_fn(mut ty: TraitItemFn, from: &Type, to: &Type) ->
     ty
 }
 
+/// Replace every named lifetime (other than `'static`) in a type with `to`.
+/// Used to refer to a specialization's self type from inside the (lifetime-agnostic)
+/// dispatcher: `'static` for the type-id comparison (which erases lifetimes anyway),
+/// and `'_` for the actual call (so the lifetime is inferred and the transmute stays
+/// an identity conversion at the caller's lifetime).
+fn map_lifetimes(mut ty: Type, to: Lifetime) -> Type {
+    struct V(Lifetime);
+    impl VisitMut for V {
+        fn visit_lifetime_mut(&mut self, i: &mut Lifetime) {
+            if i.ident != "static" {
+                *i = self.0.clone();
+            }
+        }
+    }
+    V(to).visit_type_mut(&mut ty);
+    ty
+}
+
 fn check_defaultness(item_impl: &ItemImpl) -> Option<bool> {
     let mut ret = false;
     // does not support impl-level default keyword
@@ -322,8 +340,28 @@ fn contains_generics_param(param: &GenericParam, ty: &Type) -> bool {
     visitor.1
 }
 
+/// A name key for de-duplicating generic parameters by what they introduce.
+fn generic_param_key(p: &GenericParam) -> String {
+    match p {
+        GenericParam::Lifetime(l) => format!("'{}", l.lifetime.ident),
+        GenericParam::Type(t) => t.ident.to_string(),
+        GenericParam::Const(c) => c.ident.to_string(),
+    }
+}
+
+/// Whether a generic parameter is referenced anywhere in a function signature's
+/// argument or return types (used to decide which params the inner impl must declare).
+fn param_in_sig(p: &GenericParam, sig: &Signature) -> bool {
+    let used = |ty: &Type| contains_generics_param(p, ty);
+    sig.inputs.iter().any(|arg| match arg {
+        FnArg::Typed(pt) => used(&pt.ty),
+        FnArg::Receiver(r) => used(&r.ty),
+    }) || matches!(&sig.output, ReturnType::Type(_, ty) if used(ty))
+}
+
 fn specialize_item_fn_trait(
     impl_: &ItemImpl,
+    extra_generics: &Punctuated<GenericParam, Token![,]>,
     ident: &Ident,
     fn_ident: &Ident,
     impl_item_fn: &ImplItemFn,
@@ -331,34 +369,69 @@ fn specialize_item_fn_trait(
     self_ty: &Type,
 ) -> (TokenStream, Punctuated<GenericParam, Token![,]>) {
     let trait_path = &impl_.trait_.as_ref().unwrap().1;
-    let impl_generics: Punctuated<_, Token![,]> = impl_
-        .generics
-        .params
+    let trait_ty = Type::Path(TypePath {
+        qself: None,
+        path: trait_path.clone(),
+    });
+
+    let mut item_fn = replace_type_of_trait_item_fn(
+        TraitItemFn {
+            attrs: vec![],
+            sig: impl_item_fn.sig.clone(),
+            default: None,
+            semi_token: Some(Default::default()),
+        },
+        &impl_.self_ty,
+        &parse_quote!(Self),
+    );
+    item_fn.sig.ident = fn_ident.clone();
+    // The inner trait method is a *declaration* (no body), so its argument patterns
+    // must be plain identifiers; the implementing method below keeps the original
+    // patterns and body. Trait/impl signatures only need matching types, not names.
+    set_argument_named(&mut item_fn.sig);
+
+    // Candidate generics: this impl's own parameters plus the specialization's
+    // parameters (e.g. lifetimes appearing in a specialized type like `Foo<'a>` or
+    // `&'a str`), de-duplicated by name. We then keep only those actually referenced.
+    let mut pool: Vec<GenericParam> = Vec::new();
+    for p in impl_.generics.params.iter().chain(extra_generics.iter()) {
+        let key = generic_param_key(p);
+        if !pool.iter().any(|q| generic_param_key(q) == key) {
+            pool.push(p.clone());
+        }
+    }
+
+    // Parameters referenced by the self type or trait path are declared on the inner
+    // impl (e.g. `impl<'a> .. for Foo<'a>`).
+    let impl_generics: Punctuated<_, Token![,]> = pool
         .iter()
+        .filter(|p| contains_generics_param(p, &trait_ty) || contains_generics_param(p, self_ty))
+        .cloned()
+        .collect();
+    // A specialization lifetime that appears only in the *method signature* (not the
+    // self type or trait path) is declared as a method-level lifetime instead, e.g.
+    // `impl Tr<&'a str>`'s method becomes `fn inner<'a>(&self, u: &'a str)`.
+    let mut method_extra_lifetimes: Vec<GenericParam> = pool
+        .iter()
+        .filter(|p| matches!(p, GenericParam::Lifetime(_)))
         .filter(|p| {
-            contains_generics_param(
-                p,
-                &Type::Path(TypePath {
-                    qself: None,
-                    path: trait_path.clone(),
-                }),
-            ) || contains_generics_param(p, self_ty)
+            param_in_sig(p, &item_fn.sig)
+                && !impl_generics
+                    .iter()
+                    .any(|q| generic_param_key(q) == generic_param_key(p))
         })
         .cloned()
         .collect();
-    let ty_generics: Punctuated<_, Token![,]> = impl_
-        .generics
-        .params
+    for p in &mut method_extra_lifetimes {
+        if let GenericParam::Lifetime(l) = p {
+            l.attrs.clear();
+            l.colon_token = None;
+            l.bounds = Punctuated::new();
+        }
+    }
+    let ty_generics: Punctuated<_, Token![,]> = pool
         .iter()
-        .filter(|p| {
-            contains_generics_param(
-                p,
-                &Type::Path(TypePath {
-                    qself: None,
-                    path: trait_path.clone(),
-                }),
-            )
-        })
+        .filter(|p| contains_generics_param(p, &trait_ty))
         .map(|p| {
             let mut p = p.clone();
             match &mut p {
@@ -383,20 +456,15 @@ fn specialize_item_fn_trait(
             p
         })
         .collect();
-    let mut item_fn = replace_type_of_trait_item_fn(
-        TraitItemFn {
-            attrs: vec![],
-            sig: impl_item_fn.sig.clone(),
-            default: None,
-            semi_token: Some(Default::default()),
-        },
-        &impl_.self_ty,
-        &parse_quote!(Self),
-    );
-    item_fn.sig.ident = fn_ident.clone();
     let mut impl_item_fn = impl_item_fn.clone();
     impl_item_fn.defaultness = None;
     impl_item_fn.sig.ident = fn_ident.clone();
+    // Declare the method-level lifetimes on both the trait declaration and the impl
+    // method (their signatures must match), in front of any existing generics.
+    for lt in method_extra_lifetimes.into_iter().rev() {
+        item_fn.sig.generics.params.insert(0, lt.clone());
+        impl_item_fn.sig.generics.params.insert(0, lt);
+    }
     let out = quote! {
         trait #ident<#ty_generics>: #trait_path
             #(if needs_sized_bound) { + ::core::marker::Sized }
@@ -412,18 +480,25 @@ fn specialize_item_fn_trait(
     (out, ty_generics)
 }
 
+/// Replace every by-value argument pattern with a fresh, plain identifier.
+///
+/// This is applied to the signatures that are *re-emitted* by the macro: the
+/// outer dispatcher's signature (whose body only forwards its arguments) and the
+/// generated inner-trait method *declarations* (which are bodyless, where any
+/// non-trivial pattern is rejected by `E0642`). It must NOT be applied to the
+/// method bodies, which keep their original patterns. Forwarding a fresh
+/// identifier is always a valid expression, which avoids the historical panics on
+/// `mut x` / `ref x` and the `E0642` on tuple/struct patterns.
 fn set_argument_named(sig: &mut Signature) {
     for (n, arg) in sig.inputs.iter_mut().enumerate() {
         if let FnArg::Typed(PatType { pat, .. }) = arg {
-            if let Pat::Wild(_) = &**pat {
-                *pat = Box::new(Pat::Ident(PatIdent {
-                    attrs: Vec::new(),
-                    by_ref: None,
-                    mutability: None,
-                    ident: Ident::new(&format!("_min_specialization_v{}", n), pat.span()),
-                    subpat: None,
-                }));
-            }
+            *pat = Box::new(Pat::Ident(PatIdent {
+                attrs: Vec::new(),
+                by_ref: None,
+                mutability: None,
+                ident: Ident::new(&format!("_min_specialization_v{}", n), pat.span()),
+                subpat: None,
+            }));
         }
     }
 }
@@ -436,7 +511,33 @@ fn specialize_item_fn(
 ) -> ImplItemFn {
     let itrait_name = Ident::new("__MinSpecialization_InnerTrait", Span::call_site());
     let ifn_name = Ident::new("__min_specialization__inner_fn", Span::call_site());
+    // Keep the original method (patterns + body) for the inner default-trait impl;
+    // the outer dispatcher uses freshly-named arguments so it can forward them.
+    let orig_ifn = ifn.clone();
     set_argument_named(&mut ifn.sig);
+    // A method may have its own generic parameters. Inside the dispatcher those are
+    // in scope (the outer method declares them), so we forward them to the inner
+    // method as an explicit turbofish. This pins the inner method's generics across
+    // the type-erasing transmute (otherwise they could not be inferred -> `E0282`).
+    // Forwarding is positional, so the inner method's parameter names are irrelevant.
+    let method_turbofish: TokenStream = {
+        let args: Vec<&Ident> = ifn
+            .sig
+            .generics
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                GenericParam::Type(t) => Some(&t.ident),
+                GenericParam::Const(c) => Some(&c.ident),
+                GenericParam::Lifetime(_) => None,
+            })
+            .collect();
+        if args.is_empty() {
+            quote! {}
+        } else {
+            quote! { ::<#(#args),*> }
+        }
+    };
     let specials_out = specials
         .into_iter()
         .enumerate()
@@ -483,15 +584,25 @@ fn specialize_item_fn(
                         continue;
                     }
                 }
+                // The type-id check is lifetime-agnostic, so erase the special's
+                // lifetimes to `'static` (which is always nameable) to avoid
+                // referencing the special impl's lifetimes, which are not in scope
+                // in this dispatcher.
+                let rhs = map_lifetimes(rhs.clone(), parse_quote!('static));
                 condition.extend(quote! {
-                    && __min_specialization_id::<#lhs> as *const ()
-                        == __min_specialization_id::<#rhs> as *const ()
+                    && __min_specialization_type_id::<#lhs>()
+                        == __min_specialization_type_id::<#rhs>()
                 });
             }
             let sfn = sfn.replace_type_params(replacement.clone());
             let replaced_self_ty = default_impl.self_ty.clone().replace_type_params(m.clone());
+            // For the actual call, refer to the self type with inferred (`'_`)
+            // lifetimes so they unify with the caller's; the inner impl below is
+            // generic over those lifetimes, keeping the transmute an identity.
+            let replaced_self_ty_call = map_lifetimes(replaced_self_ty.clone(), parse_quote!('_));
             let (special_trait_impl, special_trait_params) = specialize_item_fn_trait(
                 default_impl,
+                &simpl.generics.params,
                 &strait_name,
                 &sfn_name,
                 &sfn,
@@ -502,7 +613,7 @@ fn specialize_item_fn(
                 if #condition {
                     #special_trait_impl
                     __min_specialization_transmute(
-                        <#replaced_self_ty as #strait_name<
+                        <#replaced_self_ty_call as #strait_name<
                             #(for par in &special_trait_params), {
                                 #(if let GenericParam::Type(TypeParam{ident, ..}) = par) {
                                     #(if let Some(ident) = replacement.get(ident)) {
@@ -515,7 +626,7 @@ fn specialize_item_fn(
                                     #par
                                 }
                             }
-                        >>::#sfn_name(
+                        >>::#sfn_name #{&method_turbofish}(
                             #(for arg in &ifn.sig.inputs), {
                                 #(if let FnArg::Receiver(_) = arg) {
                                     __min_specialization_transmute(self)
@@ -530,11 +641,13 @@ fn specialize_item_fn(
             }
         })
         .collect::<Vec<_>>();
+    let no_extra_generics = Punctuated::new();
     let (default_trait_impl, default_trait_params) = specialize_item_fn_trait(
         default_impl,
+        &no_extra_generics,
         &itrait_name,
         &ifn_name,
-        &ifn,
+        &orig_ifn,
         needs_sized_bound,
         &default_impl.self_ty,
     );
@@ -543,14 +656,42 @@ fn specialize_item_fn(
         #{&ifn.vis}
         #{&ifn.sig}
         {
-            fn __min_specialization_id<T>(input: &T) -> ! {
-                unsafe {
-                    let _ = ::core::mem::MaybeUninit::new(
-                        ::core::ptr::read_volatile(input as *const _)
-                    );
+            // Sound, lifetime-erased type identity. `TypeId::of` requires `'static`,
+            // which would forbid specializing on borrowed types such as `&str`. We
+            // instead obtain the `TypeId` of the *lifetime-erased* type via a trait
+            // object whose existential lifetime is widened to `'static` (the value is
+            // a ZST `PhantomData`, so no non-`'static` data is ever accessed). The
+            // result identifies a type up to its lifetimes, which is exactly the
+            // granularity specialization needs — `min_specialization` never dispatches
+            // on lifetimes. `TypeId` is collision-free, so this has neither the false
+            // positives (identical-code-folding) nor the false negatives of comparing
+            // function-pointer addresses.
+            fn __min_specialization_type_id<T: ?::core::marker::Sized>() -> ::core::any::TypeId {
+                trait __MinSpecializationNonStaticAny {
+                    fn __min_specialization_type_id(&self) -> ::core::any::TypeId
+                    where
+                        Self: 'static;
                 }
-                ::core::panic!()
+                impl<T: ?::core::marker::Sized> __MinSpecializationNonStaticAny
+                    for ::core::marker::PhantomData<T>
+                {
+                    fn __min_specialization_type_id(&self) -> ::core::any::TypeId
+                    where
+                        Self: 'static,
+                    {
+                        ::core::any::TypeId::of::<T>()
+                    }
+                }
+                let it = ::core::marker::PhantomData::<T>;
+                let it: &dyn __MinSpecializationNonStaticAny = &it;
+                let it: &(dyn __MinSpecializationNonStaticAny + 'static) =
+                    unsafe { ::core::mem::transmute(it) };
+                it.__min_specialization_type_id()
             }
+            // Whenever a branch is taken, the generic `T` and the concrete branch type
+            // are the same type (up to lifetimes), so the transmutes below are identity
+            // conversions. The size/align assertions are retained purely as cheap
+            // defense-in-depth; they always hold.
             fn __min_specialization_transmute<T, U>(input: T) -> U {
                 ::core::assert_eq!(
                     ::core::mem::size_of::<T>(),
@@ -573,7 +714,7 @@ fn specialize_item_fn(
             #( #specials_out)*
             {
                 #default_trait_impl
-                <#{&default_impl.self_ty} as #itrait_name<#default_trait_params>>::#ifn_name(
+                <#{&default_impl.self_ty} as #itrait_name<#default_trait_params>>::#ifn_name #{&method_turbofish}(
                     #(for arg in &ifn.sig.inputs),{
                         #(if let FnArg::Receiver(Receiver{self_token, ..}) = arg) {
                             #self_token
@@ -586,7 +727,13 @@ fn specialize_item_fn(
             }
         }
     };
-    parse2(inner).unwrap()
+    parse2(inner).unwrap_or_else(|e| {
+        abort!(
+            e.span(),
+            "#[specialization] generated code that failed to parse: {}", e;
+            note = "this is a bug in min-specialization; please report it with the offending impl"
+        )
+    })
 }
 
 fn check_needs_sized_bound(impl_: &ItemImpl) -> bool {
@@ -620,19 +767,57 @@ fn check_needs_sized_bound(impl_: &ItemImpl) -> bool {
         })
 }
 
+/// Remove every `default` keyword from an impl and its items, turning it into an
+/// ordinary impl. Leaving a stray `default fn` behind triggers `E0658`
+/// ("specialization is unstable") on stable.
+fn strip_defaultness(impl_: &mut ItemImpl) {
+    impl_.defaultness = None;
+    for item in impl_.items.iter_mut() {
+        match item {
+            ImplItem::Fn(f) => f.defaultness = None,
+            ImplItem::Const(c) => c.defaultness = None,
+            ImplItem::Type(t) => t.defaultness = None,
+            _ => {}
+        }
+    }
+}
+
 fn specialize_impl(
     mut default_impl: ItemImpl,
     special_impls: Vec<(ItemImpl, HashMap<Ident, Type>)>,
 ) -> ItemImpl {
     if special_impls.len() == 0 {
+        // A default impl with no matching specialization is just an ordinary impl;
+        // strip the `default` keyword so it does not leak `E0658` on stable.
+        strip_defaultness(&mut default_impl);
         return default_impl;
     }
     let needs_sized_bound = check_needs_sized_bound(&default_impl);
+    let default_fn_idents: HashSet<Ident> = default_impl
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ImplItem::Fn(ifn) => Some(ifn.sig.ident.clone()),
+            _ => None,
+        })
+        .collect();
     let mut fn_map = HashMap::new();
     for (simpl, ssub) in special_impls.into_iter() {
         for item in simpl.items.iter() {
             match item {
                 ImplItem::Fn(ifn) => {
+                    // A specialization may only override methods that the default impl
+                    // itself defines; otherwise the override would be silently dropped.
+                    if !default_fn_idents.contains(&ifn.sig.ident) {
+                        abort!(
+                            ifn.sig.ident.span(),
+                            "`{}` is overridden in a specialization but is not defined in the \
+                             default impl, so it cannot be specialized",
+                            ifn.sig.ident;
+                            help = "give the default impl a `default fn {}` to specialize",
+                            ifn.sig.ident
+                        );
+                    }
                     fn_map
                         .entry(ifn.sig.ident.clone())
                         .or_insert(Vec::new())
@@ -662,41 +847,53 @@ fn specialize_impl(
 }
 
 fn specialize_trait(
-    default_impls: HashSet<ItemImpl>,
-    special_impls: HashSet<ItemImpl>,
+    default_impls: Vec<ItemImpl>,
+    special_impls: Vec<ItemImpl>,
 ) -> (Vec<ItemImpl>, Vec<ItemImpl>) {
-    let mut default_map: HashMap<_, _> = default_impls
-        .iter()
-        .cloned()
-        .map(|d| (d, Vec::new()))
-        .collect();
+    let mut default_specials: Vec<Vec<(ItemImpl, HashMap<Ident, Type>)>> =
+        default_impls.iter().map(|_| Vec::new()).collect();
     let mut orphan_impls = Vec::new();
     for s in special_impls.into_iter() {
-        if let Some((d, a, _)) = default_impls
+        // Attach each specialization to the default impl it refines: the one needing
+        // the fewest non-trivial substitutions. `min_by_key` keeps the first such
+        // default on ties, so the choice follows source order and is deterministic.
+        let best = default_impls
             .iter()
-            .map(|d| {
-                substitute_impl(d, &s)
-                    .into_iter()
-                    .map(move |(sub, n)| (d, sub, n))
-            })
-            .flatten()
-            .min_by_key(|(_, _, n)| *n)
-        {
-            default_map
-                .entry(d.clone())
-                .or_insert_with(|| unreachable!())
-                .push((s, a));
+            .enumerate()
+            .flat_map(|(i, d)| substitute_impl(d, &s).into_iter().map(move |(sub, n)| (i, sub, n)))
+            .min_by_key(|(_, _, n)| *n);
+        if let Some((i, sub, _)) = best {
+            default_specials[i].push((s, sub));
         } else {
             orphan_impls.push(s);
         }
     }
-    (
-        default_map
-            .into_iter()
-            .map(|(d, s)| specialize_impl(d, s))
-            .collect(),
-        orphan_impls,
-    )
+    // Reject literally-overlapping specializations (same trait + same self type
+    // refining the same default impl). Real specialization rejects these as a
+    // coherence error (`E0119`); without this check they would silently fold into
+    // the dispatch chain with a nondeterministic winner.
+    for specials in &default_specials {
+        for (i, (a, _)) in specials.iter().enumerate() {
+            for (b, _) in specials.iter().skip(i + 1) {
+                if a.trait_.as_ref().map(|t| &t.1) == b.trait_.as_ref().map(|t| &t.1)
+                    && a.self_ty == b.self_ty
+                {
+                    abort!(
+                        b.span(),
+                        "conflicting specializations: this impl overlaps another \
+                         specialization of the same trait for the same type";
+                        note = "min-specialization cannot order overlapping specializations"
+                    );
+                }
+            }
+        }
+    }
+    let impls = default_impls
+        .into_iter()
+        .zip(default_specials)
+        .map(|(d, specials)| specialize_impl(d, specials))
+        .collect();
+    (impls, orphan_impls)
 }
 
 fn specialization_mod(module: ItemMod) -> TokenStream {
@@ -705,16 +902,19 @@ fn specialization_mod(module: ItemMod) -> TokenStream {
     } else {
         abort!(module.span(), "Require mod content")
     };
-    let (mut defaults, mut specials): (HashSet<_>, HashSet<_>) = Default::default();
+    // Source order is preserved (plain `Vec`s, not `HashSet`s) so that codegen —
+    // and in particular the order of the runtime dispatch chain — is deterministic
+    // across compilations.
+    let (mut defaults, mut specials): (Vec<ItemImpl>, Vec<ItemImpl>) = (Vec::new(), Vec::new());
     let mut generated_content = Vec::new();
     for item in content.into_iter() {
         if let Item::Impl(item_impl) = &item {
             if item_impl.trait_.is_some() {
                 if let Some(defaultness) = check_defaultness(&item_impl) {
                     if defaultness {
-                        defaults.insert(item_impl.clone());
+                        defaults.push(item_impl.clone());
                     } else {
-                        specials.insert(item_impl.clone());
+                        specials.push(item_impl.clone());
                     }
                     continue;
                 }

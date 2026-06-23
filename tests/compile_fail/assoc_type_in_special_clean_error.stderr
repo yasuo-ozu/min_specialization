@@ -1,0 +1,5 @@
+error: This item cannot be specialized
+ --> tests/compile_fail/assoc_type_in_special_clean_error.rs:6:22
+  |
+6 |     impl Tr for () { type T = u16; fn f(&self) -> usize { 1 } }
+  |                      ^^^^

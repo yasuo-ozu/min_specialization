@@ -1,0 +1,8 @@
+error: nested associated type bindings are not supported by #[specialization]
+
+         = help: lift the inner associated type binding into a separate `where` predicate
+
+ --> tests/compile_fail/nested_assoc_type.rs:5:50
+  |
+5 |     impl<T> Tr for T where T: IntoIterator<Item: IntoIterator<Item = u8>> {
+  |                                                  ^^^^^^^^^^^^
