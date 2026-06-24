@@ -490,3 +490,100 @@ fn non_static_lifetime_in_associated_type_dispatches() {
     assert_eq!(default_out, "hello"); // default: whole borrow
     assert_eq!(special_out, "ello"); // specialized: &x[1..]
 }
+
+// ---------------------------------------------------------------------------
+// Generic associated types (GATs) in the specialized trait. The GAT is declared
+// by the trait and defined by the default (blanket) impl; specializations override
+// the *method* (overriding the GAT itself in a specialization is the separate
+// "cannot specialize an associated type" limitation, see compile_fail). The GAT's
+// own generics — lifetimes and type params, with `where` bounds — must survive
+// codegen, and the returned values (which may borrow) must keep their lifetimes.
+// ---------------------------------------------------------------------------
+
+#[specialization]
+mod gat_lifetime {
+    pub trait Container {
+        type Ref<'a>
+        where
+            Self: 'a;
+        fn get_ref<'a>(&'a self) -> Self::Ref<'a>;
+    }
+    impl<T> Container for T {
+        type Ref<'a> = &'a T where T: 'a;
+        default fn get_ref<'a>(&'a self) -> Self::Ref<'a> {
+            self
+        }
+    }
+    impl Container for i32 {
+        fn get_ref<'a>(&'a self) -> Self::Ref<'a> {
+            self
+        }
+    }
+}
+
+#[test]
+fn gat_with_lifetime_param_dispatches() {
+    use gat_lifetime::Container;
+    let n = 5i32;
+    let r: &i32 = n.get_ref(); // specialized; non-'static borrow of `n`
+    assert_eq!(*r, 5);
+    let s = String::from("hi");
+    let r2: &String = s.get_ref(); // default; borrow of `s`
+    assert_eq!(r2.len(), 2);
+}
+
+#[specialization]
+mod gat_type_param {
+    pub trait Mapper {
+        type Wrap<X>;
+        fn wrap<X>(&self, x: X) -> Self::Wrap<X>;
+    }
+    impl<T> Mapper for T {
+        type Wrap<X> = Option<X>;
+        default fn wrap<X>(&self, x: X) -> Self::Wrap<X> {
+            Some(x)
+        }
+    }
+    impl Mapper for () {
+        fn wrap<X>(&self, _x: X) -> Self::Wrap<X> {
+            None
+        }
+    }
+}
+
+#[test]
+fn gat_with_type_param_dispatches() {
+    use gat_type_param::Mapper;
+    assert_eq!(5i32.wrap(7u8), Some(7u8)); // default
+    assert_eq!(Mapper::wrap(&(), 7u8), None); // specialized
+}
+
+#[specialization]
+mod gat_mixed {
+    pub trait Store {
+        type Item<'a, X>
+        where
+            Self: 'a,
+            X: 'a;
+        fn pick<'a, X: Clone + 'a>(&'a self, xs: &'a [X]) -> Self::Item<'a, X>;
+    }
+    impl<T> Store for T {
+        type Item<'a, X> = Option<&'a X> where Self: 'a, X: 'a;
+        default fn pick<'a, X: Clone + 'a>(&'a self, xs: &'a [X]) -> Self::Item<'a, X> {
+            xs.first()
+        }
+    }
+    impl Store for () {
+        fn pick<'a, X: Clone + 'a>(&'a self, xs: &'a [X]) -> Self::Item<'a, X> {
+            xs.last()
+        }
+    }
+}
+
+#[test]
+fn gat_with_lifetime_and_type_params_dispatches() {
+    use gat_mixed::Store;
+    let v = vec![1u8, 2, 3];
+    assert_eq!(5i32.pick(&v), Some(&1)); // default: first
+    assert_eq!(Store::pick(&(), &v), Some(&3)); // specialized: last
+}
