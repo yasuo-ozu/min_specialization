@@ -31,3 +31,28 @@ jobs:
         rustup default nightly
     - name: Miri (soundness + dispatch)
       run: cargo miri test --test audit_soundness --test runtime_dispatch
+
+  msrv:
+    # Verify the crate still compiles on its declared MSRV (see `rust-version` in
+    # Cargo.toml). `cargo check` only, because the test suite needs newer Rust
+    # (the GAT tests need 1.65 and the `trybuild` dev-dependency needs 1.85).
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust 1.56.0
+      run: |
+        rustup toolchain install 1.56.0 --profile minimal
+        rustup default 1.56.0
+    # No upper bounds are placed on dependencies in Cargo.toml, so a few transitive
+    # crates resolve to releases that raised their own MSRV above 1.56. Pin those
+    # (in the gitignored lockfile only) to their last 1.56-compatible release. syn
+    # needs no pin: cargo 1.56 cannot parse the Cargo features used by syn >= 2.0.57,
+    # so it naturally selects syn 2.0.56 (the last 1.56-compatible release).
+    - name: Generate an MSRV-compatible lockfile
+      run: |
+        cargo generate-lockfile
+        cargo update -p proc-macro2 --precise 1.0.101
+        cargo update -p quote --precise 1.0.40
+        cargo update -p unicode-ident --precise 1.0.22
+    - name: cargo check (MSRV 1.56.0)
+      run: cargo check --verbose
