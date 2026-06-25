@@ -1,16 +1,16 @@
 [package]
 name = "min-specialization"
-version = "0.2.0"
+version = "0.2.1"
 description = "Experimental implementation of specialization"
 license = "MIT"
 authors = ["Yasuo Ozu <yasuo@ozu.email>"]
 keywords = ["macros", "zerocost", "specialization", "proc-macro", "trait"]
 categories = [
-    "rust-patterns",
-    "development-tools",
-    "development-tools::procedural-macro-helpers",
-    "no-std",
-    "no-std::no-alloc",
+  "rust-patterns",
+  "development-tools",
+  "development-tools::procedural-macro-helpers",
+  "no-std",
+  "no-std::no-alloc",
 ]
 repository = "https://github.com/yasuo-ozu/min_specialization"
 homepage = "https://github.com/yasuo-ozu/min_specialization"
