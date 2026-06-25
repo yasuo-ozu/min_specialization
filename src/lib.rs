@@ -937,6 +937,105 @@ fn specialization_mod(module: ItemMod) -> TokenStream {
     }
 }
 
+/// Emulate the unstable [`min_specialization`] feature on **stable** Rust.
+///
+/// Applied to a module, this attribute lets you write a single *blanket*
+/// implementation of a trait that provides default behaviour for every type and
+/// then *specialize* that behaviour for specific types. The macro rewrites each
+/// `default` method of the blanket impl into a small runtime dispatcher that
+/// selects the most specific matching implementation by comparing type identity
+/// ([`TypeId`]). The choice is made at run time, though the comparison is between
+/// compile-time constants, so an optimizer may be able to eliminate it when the
+/// concrete type is statically known.
+///
+/// # Usage
+///
+/// Put the trait, the blanket `default` impl, and the specializing impls inside a
+/// module annotated with `#[specialization]`:
+///
+/// ```
+/// use min_specialization::specialization;
+///
+/// #[specialization]
+/// mod size {
+///     pub trait DataSize {
+///         fn size(&self) -> usize;
+///     }
+///
+///     // Blanket default. Methods that may be specialized are marked `default`.
+///     impl<T> DataSize for T {
+///         default fn size(&self) -> usize {
+///             std::mem::size_of::<T>()
+///         }
+///     }
+///
+///     // A specialization overrides the method for a concrete type and must
+///     // *not* repeat the `default` keyword. Borrowed types such as `&str`
+///     // work too — unlike `TypeId::of`, dispatch does not require `'static`.
+///     impl DataSize for &str {
+///         fn size(&self) -> usize {
+///             self.len()
+///         }
+///     }
+/// }
+///
+/// use size::DataSize;
+/// assert_eq!("hello".size(), 5); // specialized: &str -> len()
+/// assert_eq!(0u32.size(), 4);    // blanket default: size_of
+/// ```
+///
+/// # How dispatch is chosen
+///
+/// Each specialization is attached to the blanket impl it refines, and the
+/// generated dispatcher tries them in source order, falling back to the blanket
+/// default when none match. Dispatch is **lifetime-agnostic** — types are
+/// compared with their lifetimes erased — exactly as real `min_specialization`
+/// never dispatches on lifetimes. The dispatch is sound: a branch is taken only
+/// when the runtime type matches, so the internal reinterpretation of `self`,
+/// the arguments, and the return value is always an identity conversion.
+///
+/// # Supported
+///
+/// - Multiple specializations refining one blanket impl.
+/// - Traits with type parameters (`trait Combine<A, B>`) and lifetime parameters
+///   (`trait Borrow<'a>`).
+/// - Associated types and associated consts: they are defined by the blanket
+///   impl and read by the default method (`Self::Out`, `Self::BYTES`).
+/// - Generic methods — type, lifetime, and `const` generics, e.g.
+///   `fn nth<const N: usize>(&self) -> usize`.
+/// - Generic associated types (GATs), including lifetime and type parameters
+///   carrying `where` bounds.
+/// - Specializing on borrowed / non-`'static` types (`&str`, `Holder<'a>`) and on
+///   a lifetime-bearing trait parameter (`impl<'a> Convert<&'a str> for i32`).
+/// - Non-trivial argument patterns in methods (`mut x`, `(a, b)`, `_`).
+///
+/// # Limitations
+///
+/// Unsupported constructs are rejected with a clear, spanned error rather than
+/// miscompiling. In particular:
+///
+/// - **Only methods can be specialized.** A specialization that redefines an
+///   associated `type` or `const` is an error; the blanket impl's definition is
+///   shared by every specialization.
+/// - **A specialization may only override methods the blanket impl marks
+///   `default`.** Overriding a method that the blanket impl does not define is an
+///   error.
+/// - **Overlapping specializations are rejected.** Two specializations for the
+///   same type produce a `conflicting specializations` error; a full
+///   specialization *lattice* (e.g. ordering `Vec<i32>` ahead of `Vec<T>`) is not
+///   modelled.
+/// - **A specialization must restate the blanket impl's bounds.** Omitting them
+///   surfaces as an ordinary coherence error (`E0119`).
+/// - The `default` keyword goes on **methods**, not on the impl itself;
+///   `default impl`, `default type`, and `default const` are not supported.
+/// - No const-generic specialization and no fully-generic specializing impls
+///   (e.g. `impl<U> Tr for Vec<U>`).
+/// - Do **not** specialize on a specific lifetime (e.g.
+///   `impl Tr for Cell<&'static str>`); like real `min_specialization`, dispatch
+///   is lifetime-agnostic and cannot police it.
+///
+/// [`min_specialization`]: https://doc.rust-lang.org/unstable-book/language-features/min-specialization.html
+/// [`TypeId`]: core::any::TypeId
 #[proc_macro_error]
 #[proc_macro_attribute]
 pub fn specialization(_attr: TokenStream1, input: TokenStream1) -> TokenStream1 {
